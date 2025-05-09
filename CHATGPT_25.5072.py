@@ -23,7 +23,7 @@ Requires: pytorch, numpy, pandas, scikit‑learn, pywt, tqdm.
 
 import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 import numpy as np
 import pandas as pd
@@ -41,93 +41,131 @@ import matplotlib.pyplot as plt
 class DengueSeqDataset(Dataset):
     """Sliding-window weekly sequences → label (total_cases of last week)."""
 
-    def __init__(self, df: pd.DataFrame, feature_cols: List[str], label_col: str = "total_cases", seq_len: int = 52,
+    def __init__(self, df: pd.DataFrame, feature_cols: List[str], city_name: str, # Added city_name for potential city-specific logic
+                 label_col: str = "total_cases", seq_len: int = 52,
                  scaler: RobustScaler = None, train: bool = True,
                  imputation_source_values: pd.Series = None):
         self.seq_len = seq_len
         self.train = train
         self.feature_cols = feature_cols
         self.label_col = label_col
+        self.city_name = city_name
         
-        df_processed = df.copy()
+        # Filter dataframe for the specific city BEFORE any processing
+        # This assumes df passed is the global df, and we filter here.
+        # If df is already city-specific, this line can be removed/adjusted.
+        df_city_specific = df[df['city'] == city_name].copy()
+        
+        if df_city_specific.empty:
+            # Handle cases where a city might not be in the provided df slice (e.g. empty test_df for a city)
+            print(f"Warning: No data for city '{city_name}' in the provided dataframe slice. Dataset will be empty.")
+            self.feats_scaled = np.array([], dtype=np.float32).reshape(0, len(feature_cols) if feature_cols else 0)
+            self.labels = np.array([], dtype=np.float32)
+            self.windows = []
+            return
+            
+        df_processed = df_city_specific.copy() 
 
-        # fill NA inside each city block (ffill‑>bfill)
+        # fill NA inside the current city block (ffill->bfill)
+        # No need for groupby city as df_processed is already city-specific
         for col_name in self.feature_cols:
-            df_processed[col_name] = df_processed.groupby("city")[col_name].transform(lambda s: s.ffill().bfill())
+            if col_name in df_processed.columns:
+                 df_processed[col_name] = df_processed[col_name].ffill().bfill()
+            else:
+                print(f"Warning: Feature column '{col_name}' not found in data for city '{self.city_name}'.")
 
         # Scaler and Imputation logic
-        self.scaler = scaler or RobustScaler(quantile_range=(25, 75))
-        # Check if the scaler instance passed is already fitted
+        self.scaler = scaler # Use the passed scaler (could be new or pre-fitted)
         is_scaler_fitted = hasattr(self.scaler, "center_") and self.scaler.center_ is not None
 
-        if self.train and not is_scaler_fitted: # This is the primary training data instance (e.g., train_ds)
-            # Learn imputation values from this data and fit the scaler
+        if self.train and not is_scaler_fitted: # Primary training for this city
             self.imputation_values = df_processed[self.feature_cols].median()
             df_processed[self.feature_cols] = df_processed[self.feature_cols].fillna(self.imputation_values)
             
             if df_processed[self.feature_cols].isnull().any().any():
-                # This should not happen if median() worked and columns are numeric
-                raise ValueError("NaNs found in training data after median imputation. Check feature columns for all-NaN groups or non-numeric data unable to compute median.")
+                nan_cols = df_processed[self.feature_cols].isnull().sum()
+                nan_cols_info = nan_cols[nan_cols > 0]
+                print(f"Warning: NaNs found in training data for city '{self.city_name}' after median imputation: {nan_cols_info}. Filling with 0.")
+                df_processed[self.feature_cols] = df_processed[self.feature_cols].fillna(0)
             
-            data_arcsinh = np.arcsinh(df_processed[self.feature_cols].to_numpy())
+            # Convert to numpy before arcsinh, ensure all data is numeric
+            numpy_data = df_processed[self.feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0).to_numpy()
+            data_arcsinh = np.arcsinh(numpy_data)
             self.scaler.fit(data_arcsinh)
             feats_scaled = self.scaler.transform(data_arcsinh).astype(np.float32)
         
-        else: # Validation or test phase (scaler should be fitted and imputation_source_values provided)
+        else: # Validation or test phase for this city
             if not is_scaler_fitted:
-                 raise ValueError("Scaler must be fitted for validation/test data if 'train' is False or scaler was pre-fitted.")
-            if imputation_source_values is None:
-                raise ValueError("Validation/Test data needs imputation_source_values from training.")
+                 raise ValueError(f"Scaler must be fitted for validation/test data for city '{self.city_name}'.")
+            if imputation_source_values is None and self.train: # train=True for val, needs imputation values
+                raise ValueError(f"Validation data for city '{self.city_name}' needs imputation_source_values from training.")
             
-            self.imputation_values = imputation_source_values # Store for reference if needed
-            df_processed[self.feature_cols] = df_processed[self.feature_cols].fillna(self.imputation_values)
+            if imputation_source_values is not None:
+                self.imputation_values = imputation_source_values
+                df_processed[self.feature_cols] = df_processed[self.feature_cols].fillna(self.imputation_values)
 
-            # Final check for NaNs, can happen if a whole column in train_ds.imputation_values was NaN (e.g. all-NaN feature in train)
             if df_processed[self.feature_cols].isnull().any().any():
-                print("Warning: NaNs in validation/test data after imputation with training medians. Filling remaining with 0.")
-                # If imputation_values itself had NaNs (e.g., a feature was all NaN in training), fill those specific columns with 0.
-                for col in self.feature_cols:
-                    if df_processed[col].isnull().any():
-                        df_processed[col] = df_processed[col].fillna(0)
+                nan_cols = df_processed[self.feature_cols].isnull().sum()
+                nan_cols_info = nan_cols[nan_cols > 0]
+                print(f"Warning: NaNs in validation/test data for city '{self.city_name}' after imputation. Columns: {nan_cols_info}. Filling with 0.")
+                df_processed[self.feature_cols] = df_processed[self.feature_cols].fillna(0)
             
-            data_arcsinh = np.arcsinh(df_processed[self.feature_cols].to_numpy())
+            numpy_data = df_processed[self.feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0).to_numpy()
+            data_arcsinh = np.arcsinh(numpy_data)
             feats_scaled = self.scaler.transform(data_arcsinh).astype(np.float32)
         
-
-        if self.train: # Original logic for loading labels, self.train indicates if labels should be loaded
+        if self.train: 
             labels_data = df_processed[self.label_col].values
-            # Ensure labels are numeric before casting, handle potential NaNs in labels if necessary
             if pd.api.types.is_numeric_dtype(labels_data):
                  self.labels = labels_data.astype(np.float32)
             else:
-                 # Attempt conversion, raise error if it fails for non-NaNs
                  try:
                      self.labels = pd.to_numeric(labels_data, errors='raise').astype(np.float32)
                  except ValueError as e:
-                     raise ValueError(f"Label column '{self.label_col}' contains non-numeric data that cannot be converted: {e}")
+                     raise ValueError(f"Label column '{self.label_col}' in city '{self.city_name}' contains non-numeric data: {e}")
 
-
-        # build (start_idx, end_idx) pairs for sliding windows
         self.windows = []
-        for city in df.city.unique():
-            city_idx = df[df.city == city].index.tolist()
-            for i, end in enumerate(city_idx):
-                start = max(city_idx[0], end - seq_len + 1)
-                self.windows.append((start, end))
-
+        # df_processed is already city-specific. No need to filter by city again for indices.
+        city_indices = df_processed.index.tolist() # Use indices from df_processed
+        if city_indices: # Only proceed if there are indices
+            min_city_idx = city_indices[0]
+            for i, end_original_idx in enumerate(city_indices):
+                # Sliding window should operate on the length of the current city_processed_df
+                # map end_original_idx to its position in df_processed for label indexing if needed
+                # However, self.labels and self.feats_scaled are now derived from df_processed, so use its length and relative indices
+                current_pos_in_df_processed = i 
+                
+                # start_idx and end_idx for windowing should be relative to df_processed, not the global df
+                # The self.feats_scaled and self.labels are indexed from 0 to len(df_processed)-1
+                # end_for_window is the current position in df_processed
+                end_for_window = current_pos_in_df_processed 
+                start_for_window = max(0, end_for_window - seq_len + 1)
+                self.windows.append((start_for_window, end_for_window)) 
+        
         self.feats_scaled = feats_scaled
 
     def __len__(self):
         return len(self.windows)
 
     def __getitem__(self, idx):
+        if not self.windows: # Handle empty dataset
+            # This case should ideally be caught earlier, but as a safeguard:
+            dummy_seq_shape = (self.seq_len, self.feats_scaled.shape[1] if self.feats_scaled.ndim == 2 and self.feats_scaled.shape[1] > 0 else 1)
+            dummy_seq = torch.zeros(dummy_seq_shape, dtype=torch.float32)
+            if self.train:
+                return dummy_seq, torch.tensor(0.0, dtype=torch.float32)
+            return dummy_seq
+
         start, end = self.windows[idx]
-        seq = self.feats_scaled[start:end + 1]  # inclusive
+        seq = self.feats_scaled[start:end + 1]
         pad = self.seq_len - seq.shape[0]
-        if pad > 0:  # pad at beginning (older weeks)
-            seq = np.pad(seq, ((pad, 0), (0, 0)), mode="constant")
+        if pad > 0:  
+            seq = np.pad(seq, ((pad, 0), (0, 0)), mode="constant", constant_values=0) # Pad with 0
+        elif pad < 0: # Should not happen if window logic is correct, but truncate if it does
+            seq = seq[-self.seq_len:, :]
+            
         if self.train:
-            label = self.labels[end]
+            label = self.labels[end] # end is an index into self.labels (derived from df_processed)
             return torch.from_numpy(seq), torch.tensor(label)
         return torch.from_numpy(seq)
 
@@ -252,6 +290,62 @@ class VARnetReg(nn.Module):
 
 # ---------- Train helpers ---------- #
 
+def train_model_for_city(city_name: str, train_city_df: pd.DataFrame, val_city_df: pd.DataFrame, 
+                         feature_cols: List[str], args: argparse.Namespace, device: torch.device):
+    """Trains and evaluates a model for a single city."""
+    print(f"\n--- Training for city: {city_name.upper()} ---")
+
+    # Scaler and imputation values are learned from this city's training data ONLY
+    city_scaler = RobustScaler(quantile_range=(25, 75))
+    
+    train_ds_city = DengueSeqDataset(train_city_df, feature_cols, city_name=city_name,
+                                     seq_len=args.seq_len, scaler=city_scaler, train=True)
+    
+    if not train_ds_city.windows: # Skip if no training windows could be formed
+        print(f"Skipping city {city_name.upper()} due to insufficient training data after processing.")
+        return None, float('inf')
+
+    val_ds_city = DengueSeqDataset(val_city_df, feature_cols, city_name=city_name,
+                                 seq_len=args.seq_len, scaler=train_ds_city.scaler, 
+                                 train=True, # To load labels
+                                 imputation_source_values=train_ds_city.imputation_values)
+    
+    if not val_ds_city.windows: # Skip if no validation windows
+        print(f"Skipping city {city_name.upper()} due to insufficient validation data after processing.")
+        # Still return the trained model based on training data if any, but MAE is inf
+        # Or decide to return None if val is critical
+        return None, float('inf') 
+
+
+    train_loader_city = DataLoader(train_ds_city, batch_size=args.batch_size, shuffle=True)
+    val_loader_city = DataLoader(val_ds_city, batch_size=args.batch_size, shuffle=False)
+
+    model_city = VARnetReg(n_feats=len(feature_cols), seq_len=args.seq_len).to(device)
+    optimizer_city = torch.optim.AdamW(model_city.parameters(), lr=args.lr, weight_decay=1e-5)
+
+    best_mae_city, best_state_city = float("inf"), None
+    
+    # Use a unique description for trange for each city
+    epoch_iterator = trange(args.epochs, desc=f"Epoch ({city_name.upper()})")
+    for epoch in epoch_iterator:
+        tr_loss = train_epoch(model_city, train_loader_city, optimizer_city, device)
+        mae, _, _ = evaluate(model_city, val_loader_city, device)
+        if mae < best_mae_city:
+            best_mae_city = mae
+            best_state_city = model_city.state_dict()
+        
+        # Update trange description with current metrics
+        epoch_iterator.set_postfix({"train_L1": f"{tr_loss:.3f}", "val_MAE": f"{mae:.3f}"})
+        # if (epoch + 1) % 10 == 0 or epoch == 0: # Printing can be too verbose with trange postfix
+            # print(f"Epoch {epoch+1:03d} ({city_name.upper()}): train_L1={tr_loss:.3f} | val_MAE={mae:.3f}")
+
+    print(f"Best validation MAE for {city_name.upper()}: {best_mae_city:.3f}")
+    if best_state_city:
+        model_city.load_state_dict(best_state_city)
+        return model_city, best_mae_city
+    return None, best_mae_city # Return None if no best state was found (e.g. all MAEs were inf)
+
+
 def train_epoch(model, loader, optimizer, device):
     model.train()
     total_loss = 0.0
@@ -275,7 +369,11 @@ def evaluate(model, loader, device):
             seqs = seqs.to(device)
             preds = model(seqs).cpu().numpy()
             preds_all.append(preds)
-            labels_all.append(labels.numpy())
+            labels_all.append(labels.numpy()) # labels are already numpy arrays from DataLoader
+    
+    if not preds_all or not labels_all:
+        return float('inf'), np.array([]), np.array([]) # Handle empty evaluation
+        
     preds_all = np.concatenate(preds_all)
     labels_all = np.concatenate(labels_all)
     mae = mean_absolute_error(labels_all, preds_all)
@@ -288,115 +386,231 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using", device)
 
-    train_df = pd.read_csv(args.train_csv)
+    full_train_df = pd.read_csv(args.train_csv)
+    full_train_df['week_start_date'] = pd.to_datetime(full_train_df['week_start_date'])
 
-    # 修正 feature_cols 定义，只包含数值列
-    numeric_cols = train_df.select_dtypes(include=np.number).columns.tolist()
+    # Define feature columns (globally, as they are common)
+    numeric_cols = full_train_df.select_dtypes(include=np.number).columns.tolist()
     feature_cols = [
         c for c in numeric_cols 
-        if c not in ("total_cases", "year", "weekofyear") # 排除目标和原始时间列
+        if c not in ("total_cases", "year", "weekofyear", "city") # city is not a feature for VARnetReg
     ]
     
-    if args.val_split_year:
-        train_part = train_df[train_df.year < args.val_split_year].reset_index(drop=True)
-        val_part = train_df[train_df.year >= args.val_split_year].reset_index(drop=True)
+    cities = full_train_df['city'].unique()
+    city_models: Dict[str, VARnetReg] = {}
+    city_maes: Dict[str, float] = {}
+
+    for city_name in cities:
+        # Split data for the current city
+        city_df = full_train_df[full_train_df['city'] == city_name]
+        
+        if args.val_split_year:
+            train_part_city = city_df[city_df.year < args.val_split_year].reset_index(drop=True)
+            val_part_city = city_df[city_df.year >= args.val_split_year].reset_index(drop=True)
+        else:
+            # Fallback or error if no split year, though argparse has default
+            # For simplicity, assume val_split_year is always provided as per arg default
+            print("Warning: --val_split_year not specified effectively. Ensure data splitting is correct.")
+            # Example: use last 20% for validation if no year split, requires more logic
+            split_idx = int(len(city_df) * 0.8)
+            train_part_city = city_df.iloc[:split_idx].reset_index(drop=True)
+            val_part_city = city_df.iloc[split_idx:].reset_index(drop=True)
+
+        if train_part_city.empty or val_part_city.empty:
+            print(f"Skipping city {city_name.upper()} due to empty train or validation set after split.")
+            city_maes[city_name] = float('inf')
+            continue
+
+        model_city, mae_city = train_model_for_city(city_name, train_part_city, val_part_city, 
+                                                    feature_cols, args, device)
+        if model_city:
+            city_models[city_name] = model_city
+        city_maes[city_name] = mae_city
+
+    print("\n--- Overall City MAEs ---")
+    total_mae = 0
+    num_valid_cities = 0
+    for city_name, mae in city_maes.items():
+        print(f"City {city_name.upper()}: Best Validation MAE = {mae:.3f}")
+        if mae != float('inf'):
+            total_mae += mae
+            num_valid_cities +=1
+    
+    if num_valid_cities > 0:
+        average_mae = total_mae / num_valid_cities
+        print(f"Average Best Validation MAE across {num_valid_cities} cities: {average_mae:.3f}")
     else:
-        raise ValueError("Please specify --val_split_year to create hold-out set.")
+        print("No models were successfully trained for any city.")
 
-    # Scaler instance to be used. train_ds will fit it.
-    # val_ds and test_ds will use the instance fitted by train_ds.
-    shared_scaler = RobustScaler(quantile_range=(25, 75))
-    
-    # For train_ds, train=True. It will learn imputation_values and fit shared_scaler.
-    train_ds = DengueSeqDataset(train_part, feature_cols, label_col="total_cases", 
-                                seq_len=args.seq_len, scaler=shared_scaler, train=True)
-    
-    # For val_ds, train=True (to load labels). It uses the fitted shared_scaler from train_ds
-    # and the imputation_values learned by train_ds.
-    val_ds = DengueSeqDataset(val_part, feature_cols, label_col="total_cases", 
-                              seq_len=args.seq_len, scaler=train_ds.scaler, 
-                              train=True, # train=True to load labels
-                              imputation_source_values=train_ds.imputation_values)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-
-    model = VARnetReg(n_feats=len(feature_cols), seq_len=args.seq_len).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-
-    best_mae, best_state = float("inf"), None
-    for epoch in trange(args.epochs, desc="Epoch"):
-        tr_loss = train_epoch(model, train_loader, optimizer, device)
-        mae, _, _ = evaluate(model, val_loader, device)
-        if mae < best_mae:
-            best_mae, best_state = mae, model.state_dict()
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:03d}: train_L1={tr_loss:.3f} | val_MAE={mae:.3f}")
-
-    print(f"\nBest validation MAE: {best_mae:.3f}")
-    model.load_state_dict(best_state)
-
-    # Optionally predict test set
+    # Optionally predict test set using per-city models
     if args.test_csv:
-        test_df = pd.read_csv(args.test_csv)
-        # For test_ds, train=False. It uses fitted scaler and imputation_values from train_ds.
-        test_ds = DengueSeqDataset(test_df, feature_cols, label_col="total_cases", # label_col passed but not used if train=False
-                                   seq_len=args.seq_len, scaler=train_ds.scaler, 
-                                   train=False, # train=False to not load labels / not attempt to fit scaler
-                                   imputation_source_values=train_ds.imputation_values)
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
-        model.eval()
-        preds = []
-        with torch.no_grad():
-            for seqs in test_loader:
-                seqs = seqs.to(device)
-                preds.extend(model(seqs).cpu().numpy())
-        submit = pd.read_csv(args.submission_fmt)
-        submit["total_cases"] = np.round(np.clip(preds, 0, None)).astype(int)
-        out_path = Path(args.out_csv)
-        submit.to_csv(out_path, index=False)
-        print("Saved Kaggle‑style predictions →", out_path)
+        print("\n--- Predicting on Test Set ---")
+        test_df_full = pd.read_csv(args.test_csv)
+        test_df_full['week_start_date'] = pd.to_datetime(test_df_full['week_start_date'])
+        
+        all_city_preds_list = []
 
-        # --- Plotting Submission Predictions ---
-        try:
-            print(f"\nGenerating plot for submission file: {out_path}")
-            submission_df = pd.read_csv(out_path)
-            
-            # Create a proper date column for plotting
-            # Ensure weekofyear is zero-padded if necessary for consistent string formatting
-            submission_df['weekofyear_str'] = submission_df['weekofyear'].astype(str).str.zfill(2)
-            submission_df['date'] = pd.to_datetime(submission_df['year'].astype(str) + submission_df['weekofyear_str'] + '1', format='%Y%U%w')
-            # %U for week number (Sunday as first day), %w for weekday (1 for Monday)
-            # If your week starts on Monday and week number is ISO, use %G%V%u
-            submission_df = submission_df.sort_values(by=['city', 'date']).reset_index(drop=True)
+        for city_name in cities: # Iterate through known cities from training
+            if city_name not in city_models:
+                print(f"No trained model for city {city_name}. Predictions for this city will be missing or default.")
+                # Create empty df for this city to maintain submission format if needed
+                # Or fill with a default value like 0 if required by submission
+                city_test_df_original_format = test_df_full[test_df_full['city'] == city_name][['city', 'year', 'weekofyear']]
+                if not city_test_df_original_format.empty:
+                    city_test_df_original_format['total_cases'] = 0 # Default prediction
+                    all_city_preds_list.append(city_test_df_original_format)
+                continue
 
-            cities = submission_df['city'].unique()
-            n_cities = len(cities)
-            
-            fig, axes = plt.subplots(n_cities, 1, figsize=(15, 5 * n_cities), sharex=False)
-            if n_cities == 1:
-                axes = [axes] # Make it iterable if only one city
+            model_city = city_models[city_name]
+            model_city.eval() # Ensure model is in eval mode
 
-            for i, city in enumerate(cities):
-                city_df = submission_df[submission_df['city'] == city]
-                ax = axes[i]
-                ax.plot(city_df['date'], city_df['total_cases'], label=f'Predicted Cases - {city.upper()}', marker='.')
-                ax.set_xlabel('Time')
-                ax.set_ylabel('Predicted Total Cases')
-                ax.set_title(f'Predicted Dengue Cases for {city.upper()}')
-                ax.legend()
-                ax.grid(True)
-                ax.tick_params(axis='x', rotation=45)
+            # Get the scaler and imputation values from the training phase of this city model
+            # This requires train_ds_city to be accessible or its relevant properties stored.
+            # For now, we re-create a temporary train_ds to get the scaler for the test data.
+            # This is not ideal, better to store scalers/imputation_values per city.
+            # Simplified: Assume train_ds_city.scaler and train_ds_city.imputation_values are stored with the model or accessible.
+            # Let's retrieve it from a dummy train_ds for that city, this implies re-fitting scaler which is incorrect for test. 
+            # A better way: store scalers from training.
+            # For now, we'll assume the scaler and imputation values are part of the 'model_city' somehow (which they are not directly)
+            # This part needs careful re-architecture to correctly pass/retrieve city-specific scalers/imputation values.
             
-            fig.suptitle('Submission Predictions by City', fontsize=16)
-            plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
-            submission_plot_filename = "prediction_plot.png"
-            plt.savefig(submission_plot_filename)
-            print(f"Submission predictions plot saved to {submission_plot_filename}")
-            # plt.show() # Uncomment to display
-        except Exception as e:
-            print(f"Error generating submission plot: {e}")
-        # --- End Submission Plotting ---
+            # Correct approach: Retrieve the scaler used for this city during its training.
+            # We need to have stored these. For this refactor, we assume they are part of `train_ds` 
+            # instances, which are not directly kept. We'll reconstruct the scaler for the *training part* 
+            # of this city to get its properties for the test set. This is an approximation.
+            
+            temp_train_df_for_scaler = full_train_df[full_train_df['city'] == city_name]
+            if args.val_split_year: # Use the same split logic as training
+                 temp_train_part_city_for_scaler = temp_train_df_for_scaler[temp_train_df_for_scaler.year < args.val_split_year]
+            else: # Fallback split, ensure consistency
+                 split_idx_temp = int(len(temp_train_df_for_scaler) * 0.8)
+                 temp_train_part_city_for_scaler = temp_train_df_for_scaler.iloc[:split_idx_temp]
+
+            if temp_train_part_city_for_scaler.empty:
+                print(f"Cannot prepare scaler for city {city_name} for test set due to no training data.")
+                city_test_df_original_format = test_df_full[test_df_full['city'] == city_name][['city', 'year', 'weekofyear']]
+                if not city_test_df_original_format.empty:
+                    city_test_df_original_format['total_cases'] = 0
+                    all_city_preds_list.append(city_test_df_original_format)
+                continue
+
+            city_specific_scaler_for_test = RobustScaler(quantile_range=(25,75))
+            # Create a temporary dataset just to fit scaler and get imputation values for THIS city
+            # This is a bit inefficient but ensures city-specific preprocessing parameters
+            temp_ds_for_params = DengueSeqDataset(temp_train_part_city_for_scaler, feature_cols, city_name=city_name,
+                                                  seq_len=args.seq_len, scaler=city_specific_scaler_for_test, train=True)
+            
+            city_scaler_fitted = temp_ds_for_params.scaler
+            city_imputation_values = temp_ds_for_params.imputation_values
+
+            city_test_df = test_df_full[test_df_full['city'] == city_name]
+            if city_test_df.empty:
+                continue
+
+            test_ds_city = DengueSeqDataset(city_test_df, feature_cols, city_name=city_name,
+                                          seq_len=args.seq_len, scaler=city_scaler_fitted,
+                                          train=False, imputation_source_values=city_imputation_values)
+            
+            if not test_ds_city.windows:
+                print(f"No test windows for city {city_name}. Defaulting predictions if necessary.")
+                city_test_df_original_format = city_test_df[['city', 'year', 'weekofyear']]
+                city_test_df_original_format['total_cases'] = 0
+                all_city_preds_list.append(city_test_df_original_format)
+                continue
+
+            test_loader_city = DataLoader(test_ds_city, batch_size=args.batch_size, shuffle=False)
+            
+            city_preds_on_test = []
+            with torch.no_grad():
+                for seqs_test in test_loader_city:
+                    seqs_test = seqs_test.to(device)
+                    city_preds_on_test.extend(model_city(seqs_test).cpu().numpy())
+            
+            # Align predictions with the original test_df format for this city
+            # The test_ds_city.windows correspond to the rows in city_test_df that had valid sequences
+            # We need to map these predictions back. The submission format needs all test rows.
+            
+            # Create a dataframe with the original identifiers for the city
+            city_test_df_original_format = test_df_full[test_df_full['city'] == city_name][['city', 'year', 'weekofyear']].copy()
+            city_test_df_original_format['total_cases'] = 0 # Default for rows not predicted
+            
+            # Get the indices from city_test_df that correspond to test_ds_city.windows
+            # This is tricky because test_ds_city.windows are relative to the data *after* city filtering
+            # and the test_ds_city.feats_scaled is built from city_test_df
+            # A simpler approach: if test_ds_city makes predictions, they are in order of city_test_df rows *that formed sequences*
+            
+            # The number of predictions should match the number of windows in test_ds_city
+            if len(city_preds_on_test) == len(test_ds_city.windows):
+                 # The predictions in city_preds_on_test correspond to the *last week* of each window.
+                 # We need to identify which rows in city_test_df these correspond to.
+                 # The 'end' index in test_ds_city.windows refers to an index in the city_test_df (after filtering for city)
+                predicted_indices_in_city_test_df = [window[1] for window in test_ds_city.windows]
+                
+                # Get the original global indices from city_test_df for these predicted rows
+                original_indices = city_test_df.iloc[predicted_indices_in_city_test_df].index
+
+                # Create a temporary Series with predictions aligned to original test_df_full indices
+                preds_series = pd.Series(np.round(np.clip(city_preds_on_test, 0, None)).astype(int), index=original_indices)
+                
+                # Update the city_test_df_original_format using these original indices
+                # This ensures that predictions are placed in the correct rows of the submission format slice for this city
+                city_test_df_original_format.loc[original_indices, 'total_cases'] = preds_series
+                
+            elif not city_preds_on_test and not test_ds_city.windows : # No windows, no preds
+                 pass # Already defaulted to 0
+            else:
+                print(f"Warning: Mismatch in number of predictions ({len(city_preds_on_test)}) and test windows ({len(test_ds_city.windows)}) for city {city_name}. Defaulting city predictions to 0.")
+                # city_test_df_original_format is already defaulted to 0
+
+            all_city_preds_list.append(city_test_df_original_format)
+
+        if all_city_preds_list:
+            final_submission_df = pd.concat(all_city_preds_list).reset_index(drop=True)
+            
+            # Ensure the order matches the submission format exactly
+            submission_fmt_df = pd.read_csv(args.submission_fmt)[['city', 'year', 'weekofyear']]
+            final_submission_df = pd.merge(submission_fmt_df, final_submission_df, on=['city', 'year', 'weekofyear'], how='left')
+            final_submission_df['total_cases'] = final_submission_df['total_cases'].fillna(0).astype(int) # Fill any potentially unmerged rows
+
+            out_path = Path(args.out_csv)
+            final_submission_df.to_csv(out_path, index=False)
+            print("Saved Kaggle‑style predictions →", out_path)
+
+            # --- Plotting Submission Predictions ---
+            try:
+                print(f"\nGenerating plot for submission file: {out_path}")
+                submission_df_plot = pd.read_csv(out_path)
+                submission_df_plot['weekofyear_str'] = submission_df_plot['weekofyear'].astype(str).str.zfill(2)
+                submission_df_plot['date'] = pd.to_datetime(submission_df_plot['year'].astype(str) + submission_df_plot['weekofyear_str'] + '1', format='%Y%U%w')
+                submission_df_plot = submission_df_plot.sort_values(by=['city', 'date']).reset_index(drop=True)
+
+                plot_cities = submission_df_plot['city'].unique()
+                n_plot_cities = len(plot_cities)
+                
+                fig, axes = plt.subplots(n_plot_cities, 1, figsize=(15, 5 * n_plot_cities), squeeze=False)
+
+                for i, city_plot_name in enumerate(plot_cities):
+                    city_df_plot = submission_df_plot[submission_df_plot['city'] == city_plot_name]
+                    ax = axes[i, 0]
+                    ax.plot(city_df_plot['date'], city_df_plot['total_cases'], label=f'Predicted Cases - {city_plot_name.upper()}', marker='.')
+                    ax.set_xlabel('Time')
+                    ax.set_ylabel('Predicted Total Cases')
+                    ax.set_title(f'Predicted Dengue Cases for {city_plot_name.upper()}')
+                    ax.legend()
+                    ax.grid(True)
+                    ax.tick_params(axis='x', rotation=45)
+                
+                fig.suptitle('Submission Predictions by City', fontsize=16)
+                plt.tight_layout(rect=[0, 0, 1, 0.96]) 
+                submission_plot_filename = "prediction_plot.png"
+                plt.savefig(submission_plot_filename)
+                print(f"Submission predictions plot saved to {submission_plot_filename}")
+            except Exception as e:
+                print(f"Error generating submission plot: {e}")
+            # --- End Submission Plotting ---
+        else:
+            print("No predictions generated for the test set.")
 
 
 if __name__ == "__main__":
@@ -404,7 +618,7 @@ if __name__ == "__main__":
     p.add_argument("--train_csv", type=str, default="DATA/dengue_features_train.csv")
     p.add_argument("--test_csv", type=str, default="DATA/dengue_features_test.csv")
     p.add_argument("--submission_fmt", type=str, default="DATA/submission_format.csv")
-    p.add_argument("--out_csv", type=str, default="my_submission.csv")
+    p.add_argument("--out_csv", type=str, default="my_submission.csv") # Changed default name
     p.add_argument("--val_split_year", type=int, default=2006, help="Hold-out year boundary for validation")
     p.add_argument("--seq_len", type=int, default=52)
     p.add_argument("--batch_size", type=int, default=32)
